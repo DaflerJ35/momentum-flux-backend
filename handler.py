@@ -28,6 +28,21 @@ Output:
 """
 
 import os
+# Kill flash-attn before any torch/transformers import attempts to register
+# its custom ops — otherwise we crash on torch.library.infer_schema with
+# PEP 604 union types.
+os.environ.setdefault("DIFFUSERS_NO_FLASH_ATTN", "1")
+os.environ.setdefault("TRANSFORMERS_ATTN_IMPLEMENTATION", "eager")
+os.environ.setdefault("XFORMERS_DISABLED", "1")
+
+import sys
+# Block any flash_attn import attempted later in the stack.
+class _BlockedFlashAttn:
+    def __getattr__(self, name):
+        raise ImportError("flash_attn intentionally disabled")
+for _name in ("flash_attn", "flash_attn_3", "flash_attn_interface"):
+    sys.modules[_name] = _BlockedFlashAttn()  # type: ignore
+
 import time
 import base64
 import runpod
