@@ -1,21 +1,23 @@
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs && \
+    git git-lfs ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Python deps — layer caches well
+# Install Python deps. Do NOT reinstall torch — the base image has the CUDA-enabled version.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r requirements.txt
 
-# Handler
 COPY handler.py .
 
-# HF_TOKEN is provided at runtime via RunPod env vars.
-# FLUX weights download on first request (cached across warm workers).
-# This keeps the build fast and reliable — no 24GB download during docker build.
+# HF_TOKEN is provided by RunPod at runtime.
+# FLUX weights download on the first request (lazy load in handler).
 
 CMD ["python", "-u", "handler.py"]
