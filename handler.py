@@ -121,35 +121,37 @@ DEFAULT_NEGATIVE = (
 # ─────────────────────────────────────────────────────────────────────────────
 # Model load (cold start)
 # ─────────────────────────────────────────────────────────────────────────────
-print("🚀 Loading FLUX.1-dev…")
-pipe = FluxPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+print("[boot] Loading FLUX.1-dev...", flush=True)
+_hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+
+try:
+    pipe = FluxPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        token=_hf_token,
+    )
+    print("[boot] Pipeline loaded from HF cache", flush=True)
+except Exception as e:
+    print(f"[boot][FATAL] Pipeline load failed: {e}", flush=True)
+    raise
 
 if torch.cuda.is_available():
-    pipe.vae.enable_tiling()
-    pipe.vae.enable_slicing()
-    pipe.enable_model_cpu_offload()
     try:
-        pipe.transformer = torch.compile(
-            pipe.transformer, mode="reduce-overhead", fullgraph=False
-        )
-        print("✅ Transformer compiled")
+        pipe = pipe.to("cuda")
+        print("[boot] Moved to CUDA", flush=True)
     except Exception as e:
-        print(f"⚠️  torch.compile skipped: {e}")
+        # Fall back to cpu offload if direct GPU load fails (e.g. low VRAM)
+        print(f"[boot] .to('cuda') failed, falling back to cpu_offload: {e}", flush=True)
+        pipe.enable_model_cpu_offload()
+    try:
+        pipe.vae.enable_tiling()
+        pipe.vae.enable_slicing()
+    except Exception as e:
+        print(f"[boot] vae tiling/slicing skipped: {e}", flush=True)
+else:
+    print("[boot][WARN] CUDA not available — running on CPU will be extremely slow", flush=True)
 
-# Warmup
-print("🔥 Warmup pass…")
-try:
-    with torch.inference_mode():
-        _ = pipe(
-            "warmup",
-            num_inference_steps=1,
-            width=512,
-            height=512,
-            max_sequence_length=256,
-        ).images[0]
-    print("✅ Warmup complete")
-except Exception as e:
-    print(f"⚠️  Warmup failed (non-fatal): {e}")
+print("[boot] Ready to accept jobs", flush=True)
 
 # Track currently-loaded character LoRA so we don't reload it on every call
 _CURRENT_LORA: str | None = None
