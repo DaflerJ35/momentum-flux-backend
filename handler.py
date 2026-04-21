@@ -119,42 +119,55 @@ DEFAULT_NEGATIVE = (
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model load (cold start)
+# Lazy model load — pipeline loads on first job, not at import.
+# This lets the worker report healthy immediately so RunPod doesn't kill it
+# during the FLUX weight download / VRAM load (can take 2–5 min).
 # ─────────────────────────────────────────────────────────────────────────────
-print("[boot] Loading FLUX.1-dev...", flush=True)
-_hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-
-try:
-    pipe = FluxPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        token=_hf_token,
-    )
-    print("[boot] Pipeline loaded from HF cache", flush=True)
-except Exception as e:
-    print(f"[boot][FATAL] Pipeline load failed: {e}", flush=True)
-    raise
-
-if torch.cuda.is_available():
-    try:
-        pipe = pipe.to("cuda")
-        print("[boot] Moved to CUDA", flush=True)
-    except Exception as e:
-        # Fall back to cpu offload if direct GPU load fails (e.g. low VRAM)
-        print(f"[boot] .to('cuda') failed, falling back to cpu_offload: {e}", flush=True)
-        pipe.enable_model_cpu_offload()
-    try:
-        pipe.vae.enable_tiling()
-        pipe.vae.enable_slicing()
-    except Exception as e:
-        print(f"[boot] vae tiling/slicing skipped: {e}", flush=True)
-else:
-    print("[boot][WARN] CUDA not available — running on CPU will be extremely slow", flush=True)
-
-print("[boot] Ready to accept jobs", flush=True)
-
-# Track currently-loaded character LoRA so we don't reload it on every call
+pipe = None
 _CURRENT_LORA: str | None = None
+
+
+def get_pipe():
+    """Load the FLUX pipeline on first request, then cache globally."""
+    global pipe
+    if pipe is not None:
+        return pipe
+
+    print("[load] Importing FLUX.1-dev (first request)", flush=True)
+    t0 = time.time()
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not hf_token:
+        print("[load][WARN] HF_TOKEN not set in environment", flush=True)
+
+    try:
+        p = FluxPipeline.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.bfloat16,
+            token=hf_token,
+        )
+        print(f"[load] Weights loaded ({time.time()-t0:.1f}s)", flush=True)
+    except Exception as e:
+        print(f"[load][FATAL] from_pretrained failed: {e}", flush=True)
+        raise
+
+    if torch.cuda.is_available():
+        try:
+            p = p.to("cuda")
+            print("[load] Moved to CUDA", flush=True)
+        except Exception as e:
+            print(f"[load] Direct CUDA load failed, falling back to cpu_offload: {e}", flush=True)
+            p.enable_model_cpu_offload()
+        try:
+            p.vae.enable_tiling()
+            p.vae.enable_slicing()
+        except Exception as e:
+            print(f"[load] vae tiling/slicing skipped: {e}", flush=True)
+    else:
+        print("[load][WARN] CUDA not available — CPU inference will be extremely slow", flush=True)
+
+    pipe = p
+    print(f"[load] Pipeline ready ({time.time()-t0:.1f}s total)", flush=True)
+    return pipe
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,8 +181,9 @@ def build_prompt(prompt: str, style_preset: str | None, enhance: bool) -> str:
 
 
 def set_scheduler(name: str) -> None:
+    p = get_pipe()
     if name in SCHEDULERS:
-        pipe.scheduler = SCHEDULERS[name].from_config(pipe.scheduler.config)
+        p.scheduler = SCHEDULERS[name].from_config(p.scheduler.config)
 
 
 def load_character_lora(lora_name: str | None, weight: float) -> bool:
@@ -179,15 +193,16 @@ def load_character_lora(lora_name: str | None, weight: float) -> bool:
     LoRAs must be trained on synthetic (model-generated) data only.
     """
     global _CURRENT_LORA
+    p = get_pipe()
 
     if lora_name is None:
         if _CURRENT_LORA is not None:
             try:
-                pipe.unload_lora_weights()
+                p.unload_lora_weights()
                 _CURRENT_LORA = None
-                print("↩️  LoRA unloaded")
+                print("[lora] unloaded", flush=True)
             except Exception as e:
-                print(f"⚠️  LoRA unload failed: {e}")
+                print(f"[lora] unload failed: {e}", flush=True)
         return True
 
     # Sanitize — only allow a bare filename, no traversal
@@ -197,27 +212,26 @@ def load_character_lora(lora_name: str | None, weight: float) -> bool:
 
     lora_path = os.path.join(LORA_DIR, safe_name)
     if not os.path.isfile(lora_path):
-        print(f"⚠️  LoRA not found: {lora_path}")
+        print(f"[lora] not found: {lora_path}", flush=True)
         return False
 
     if _CURRENT_LORA == safe_name:
-        # Already loaded — just update weight
         try:
-            pipe.set_adapters(["character"], adapter_weights=[weight])
+            p.set_adapters(["character"], adapter_weights=[weight])
             return True
         except Exception:
             pass
 
     try:
         if _CURRENT_LORA is not None:
-            pipe.unload_lora_weights()
-        pipe.load_lora_weights(lora_path, adapter_name="character")
-        pipe.set_adapters(["character"], adapter_weights=[weight])
+            p.unload_lora_weights()
+        p.load_lora_weights(lora_path, adapter_name="character")
+        p.set_adapters(["character"], adapter_weights=[weight])
         _CURRENT_LORA = safe_name
-        print(f"✅ Character LoRA loaded: {safe_name} @ {weight}")
+        print(f"[lora] loaded {safe_name} @ {weight}", flush=True)
         return True
     except Exception as e:
-        print(f"⚠️  LoRA load failed: {e}")
+        print(f"[lora] load failed: {e}", flush=True)
         _CURRENT_LORA = None
         return False
 
@@ -254,6 +268,7 @@ def handler(job):
     steps = max(8, min(60, steps))
 
     final_prompt = build_prompt(prompt, style_preset, enhance_prompt)
+    p = get_pipe()
     set_scheduler(scheduler)
     load_character_lora(character_lora, character_lora_weight)
 
@@ -274,7 +289,7 @@ def handler(job):
 
         try:
             with torch.inference_mode():
-                result = pipe(
+                result = p(
                     prompt=final_prompt,
                     negative_prompt=negative_prompt,
                     num_inference_steps=steps,
